@@ -1,0 +1,155 @@
+import numpy as np
+import pandas as pd
+import os
+
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_percentage_error
+from lightgbm import LGBMRegressor 
+
+# ==========================================
+# ⚙️ 使用者基本設定
+# ==========================================
+EXCEL_PATH = r"C:\Users\Joanne\Desktop\專題進度\raw data_正.xlsx"
+TARGET_COL = "Output 1"
+
+CATEGORICAL_COLS = ["特徵值1", "特徵值2", "特徵值3", "特徵值4", "特徵值7"]
+NUMERIC_COLS = [
+    "特徵值5", "特徵值6", "特徵值9", "特徵值10", "特徵值11", "特徵值12",
+    "特徵值13", "特徵值14", "特徵值15", "特徵值16", "特徵值17", "特徵值18",
+    "特徵值19", "特徵值20", "特徵值21", "特徵值22", "特徵值23", "特徵值24"
+]
+FEATURE_COLS = CATEGORICAL_COLS + NUMERIC_COLS
+
+RANDOM_STATE = 36
+N_ESTIMATORS = 100
+N_SPLITS = 5
+
+def to_ratio_series(s: pd.Series) -> pd.Series:
+    s = s.astype(str).str.strip()
+    s = s.replace({"": np.nan, "nan": np.nan, "None": np.nan, "<NA>": np.nan})
+    has_pct = s.str.contains("%", na=False)
+    s_no_pct = s.str.replace("%", "", regex=False).str.strip()
+    num = pd.to_numeric(s_no_pct, errors="coerce")
+    num.loc[has_pct] = num.loc[has_pct] / 100.0
+    return num
+
+def main():
+    if not os.path.exists(EXCEL_PATH):
+        print(f"❌ 錯誤：找不到 Excel 檔案，請檢查路徑：{EXCEL_PATH}")
+        return
+
+    # 1) 讀取與基本清理
+    df = pd.read_excel(EXCEL_PATH)
+    df.columns = df.columns.str.strip()
+
+    for col in FEATURE_COLS:
+        if col in df.columns and df[col].astype(str).str.contains("%", na=False).any():
+            df[col] = to_ratio_series(df[col])
+
+    for col in NUMERIC_COLS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # 2) Target (y) 清理並轉為絕對值
+    y_str = df[TARGET_COL].astype(str).str.strip()
+    y_str = y_str.str.replace(r"\((.*?)\)", r"-\1", regex=True)
+    y_str = y_str.str.replace(",", "", regex=False)
+    y_str = y_str.str.replace("A", "", regex=False)
+    y = pd.to_numeric(y_str, errors="coerce").abs()
+
+    # 3) 確保特徵值9 (電壓) 為數字且大於 0 (避免除以零)
+    df["特徵值9"] = pd.to_numeric(df["特徵值9"], errors="coerce")
+    
+    # 剔除 y 缺失、電壓缺失或電壓為 0 的極端異常列
+    valid_mask = (~y.isna()) & (~df["特徵值9"].isna()) & (df["特徵值9"] > 0)
+    df = df.loc[valid_mask].copy()
+    y = y.loc[valid_mask].copy()
+
+    # 🌟 核心物理轉化：將目標變數從「電流(I)」轉換為「等效電導(G = I / V)」
+    y_conductance = y / df["特徵值9"]
+
+    # 4) 補齊特徵與缺值填補
+    for col in FEATURE_COLS:
+        if col not in df.columns:
+            df[col] = 0
+
+    numeric_medians = df[NUMERIC_COLS].median()
+    categorical_modes = df[CATEGORICAL_COLS].mode().iloc[0] if not df[CATEGORICAL_COLS].empty else "unknown"
+
+    X_raw = df[FEATURE_COLS].copy()
+    X_raw[NUMERIC_COLS] = X_raw[NUMERIC_COLS].fillna(numeric_medians)
+    X_raw[CATEGORICAL_COLS] = X_raw[CATEGORICAL_COLS].fillna("unknown")
+
+    # 5) One-hot encoding
+    X = pd.get_dummies(X_raw, columns=CATEGORICAL_COLS, drop_first=False)
+    model_features = X.columns.tolist()
+
+    # 6) 5-Fold 交叉驗證（評估模型猜測「電導」的精準度）
+    print("\n=== ⚙️ 執行 5-Fold 交叉驗證 (物理目標轉換法：預測等效電導) ===")
+    kf = KFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+    fold_metrics = []
+
+    for fold, (train_idx, test_idx) in enumerate(kf.split(X), start=1):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train_g, y_test_g = y_conductance.iloc[train_idx], y_conductance.iloc[test_idx]
+        v_test = X_test["特徵值9"]  # 驗證時要乘回來的電壓
+
+        # 這裡回歸標準穩定的隨機森林/LightGBM，不需要開可能會暴走的線性樹
+        model = LGBMRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_STATE, n_jobs=-1, verbose=-1)
+        model.fit(X_train, y_train_g)
+        
+        pred_g = model.predict(X_test)
+        
+        # 🌟 評估性能時，必須將預測的電导「乘回電壓」，還原成電流與真實的 y_test 比較
+        y_pred_current = pred_g * v_test
+        y_real_current = y.iloc[test_idx]
+
+        fold_metrics.append({
+            "R2": r2_score(y_real_current, y_pred_current), 
+            "MAPE_%": mean_absolute_percentage_error(y_real_current, y_pred_current) * 100
+        })
+
+    print(f"還原電流後的均值表現 -> 平均 R2: {pd.DataFrame(fold_metrics)['R2'].mean():.4f} | 平均 MAPE: {pd.DataFrame(fold_metrics)['MAPE_%'].mean():.2f}%")
+
+    # 🎯 全量訓練最終模型 (用全資料訓練「電導預測器」)
+    print("\n🚀 正在訓練最終物理優化模型...")
+    final_model = LGBMRegressor(n_estimators=N_ESTIMATORS, random_state=RANDOM_STATE, n_jobs=-1, verbose=-1)
+    final_model.fit(X, y_conductance)
+
+    # ==========================================================
+    # 🎯 24 特徵 自訂輸入面板
+    # ==========================================================
+    print("\n" + "="*60)
+    print("🔮 預測新資料模式（已融合歐姆定律完美外推）")
+    print("="*60)
+    
+    custom_input = {
+        "特徵值1": "U", "特徵值2": "0.028", "特徵值3": "BGA", "特徵值4": "wirebond", "特徵值7": "GND", "特徵值24": "Ins.",
+        "特徵值5": 100, "特徵值6": 0.5,
+        "特徵值9": 500,    # 👈 試試看原本大翻車的 375V！
+        "特徵值10": 5.2, "特徵值11": 5.2, "特徵值12": 27.04, "特徵值13": 1.21, "特徵值14": 37.72,
+        "特徵值15": 1, "特徵值16": 2.97, "特徵值17": 3.61, "特徵值18": 10.71, "特徵值19": 0.4,
+        "特徵值20": 0.25, "特徵值21": 0.25, "特徵值22": 0.2, "特徵值23": 0.0073
+    }
+
+    df_new = pd.DataFrame([custom_input])
+    input_v = float(df_new["特徵值9"].iloc[0]) # 記錄使用者輸入的電壓
+
+    df_new[NUMERIC_COLS] = df_new[NUMERIC_COLS].apply(pd.to_numeric, errors='coerce')
+    df_new[NUMERIC_COLS] = df_new[NUMERIC_COLS].fillna(numeric_medians)
+    df_new[CATEGORICAL_COLS] = df_new[CATEGORICAL_COLS].fillna(categorical_modes)
+
+    df_new_encoded = pd.get_dummies(df_new, columns=CATEGORICAL_COLS)
+    df_final_input = df_new_encoded.reindex(columns=model_features, fill_value=0)
+
+    # 7) 進行預測並依據歐姆定律還原
+    predicted_g = final_model.predict(df_final_input)[0]
+    predicted_current = predicted_g * input_v  # 🌟 💡 歐姆定律：I = G * V
+
+    print(f"\n[🎯 物理特徵優化預測結果]")
+    print(f"➡️ 輸入電壓 (特徵值9) = {input_v} V")
+    print(f"➡️ 模型預測之等效電導 (G) = {predicted_g:.8f} S")
+    print(f"👉 最終計算還原之 {TARGET_COL} 絕對值為: {predicted_current:.6f}")
+
+if __name__ == "__main__":
+    main()
