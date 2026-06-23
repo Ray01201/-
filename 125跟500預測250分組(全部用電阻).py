@@ -14,8 +14,9 @@ from lightgbm import LGBMRegressor
 # =========================
 # USER SETTINGS
 # =========================
-EXCEL_PATH = r"C:\專題\raw data_正(raw data).csv"
-TARGET_COL = "Output 2"
+EXCEL_PATH = r"C:\專題\raw data_正125,500.csv"
+TEST_EXCEL_PATH = r"C:\專題\raw data正250.csv"  # 💡 新測試集 CSV 的路徑
+TARGET_COL = "Output 1"
 
 CATEGORICAL_COLS = ["特徵值1", "特徵值2", "特徵值3", "特徵值4", "特徵值7", "特徵值8", "特徵值24"]
 NUMERIC_COLS = [
@@ -34,7 +35,7 @@ def get_12_models():
     """
     models = {}
     
-    # 1. 支撐向量迴歸系列 (SVR)
+    # 1. 支撐向量迴規系列 (SVR)
     models["SVR_simple"] = SVR(kernel="rbf", C=0.1, epsilon=0.2)
     models["SVR_base"]   = SVR(kernel="rbf", C=1.0, epsilon=0.1)
     models["SVR_strong"] = SVR(kernel="rbf", C=10.0, epsilon=0.02)
@@ -56,32 +57,14 @@ def get_12_models():
     
     return models
 
-def get_test_samples():
-    """
-    💡 在這裡直接寫死兩組測試數據。
-    請根據您的實際資料狀況修改底下的數值（若沒寫到的欄位會自動帶入中位數或空類別）
-    """
-    samples = [
-        # 第一組測試數據
-        {
-            "特徵值1": "T", "特徵值2": "0.02", "特徵值3": "QFP", "特徵值4": "wirebond", 
-            "特徵值7": "GND", "特徵值8": "正", "特徵值24": "Ins",
-            "特徵值5": 156, "特徵值6": 0.4, "特徵值9": 500, "特徵值10": 14, 
-            "特徵值11": 20, "特徵值12": 280, "特徵值13": 1.6, "特徵值14": 448, 
-            "特徵值15": 2, "特徵值16": 4.76, "特徵值17": 6.42, "特徵值18": 30.51, 
-            "特徵值19": 0.11, "特徵值20": 7.01, "特徵值21": 7.01, "特徵值22": 49.15, "特徵值23": 0.18
-        },
-        # 第二組測試數據
-        {
-            "特徵值1": "T", "特徵值2": "0.02", "特徵值3": "QFP", "特徵值4": "wirebond", 
-            "特徵值7": "GND", "特徵值8": "正", "特徵值24": "Ins",
-            "特徵值5": 156, "特徵值6": 0.4, "特徵值9": 450, "特徵值10": 14, 
-            "特徵值11": 20, "特徵值12": 280, "特徵值13": 1.6, "特徵值14": 448, 
-            "特徵值15": 2, "特徵值16": 4.76, "特徵值17": 6.42, "特徵值18": 30.51, 
-            "特徵值19": 0.11, "特徵值20": 7.01, "特徵值21": 7.01, "特徵值22": 49.15, "特徵值23": 0.18
-        }
-    ]
-    return pd.DataFrame(samples)
+def to_ratio_series(s: pd.Series) -> pd.Series:
+    s = s.astype(str).str.strip()
+    s = s.replace({"": np.nan, "nan": np.nan, "None": np.nan, "<NA>": np.nan})
+    has_pct = s.str.contains("%", na=False)
+    s_no_pct = s.str.replace("%", "", regex=False).str.strip()
+    num = pd.to_numeric(s_no_pct, errors="coerce")
+    num.loc[has_pct] = num.loc[has_pct] / 100.0
+    return num
 
 def main():
     # 1) Read data
@@ -89,15 +72,6 @@ def main():
     df.columns = df.columns.str.strip()
 
     # 2) 清理：特徵欄位中出現 % 的值
-    def to_ratio_series(s: pd.Series) -> pd.Series:
-        s = s.astype(str).str.strip()
-        s = s.replace({"": np.nan, "nan": np.nan, "None": np.nan, "<NA>": np.nan})
-        has_pct = s.str.contains("%", na=False)
-        s_no_pct = s.str.replace("%", "", regex=False).str.strip()
-        num = pd.to_numeric(s_no_pct, errors="coerce")
-        num.loc[has_pct] = num.loc[has_pct] / 100.0
-        return num
-
     for col in FEATURE_COLS:
         if col in df.columns and df[col].astype(str).str.contains("%", na=False).any():
             df[col] = to_ratio_series(df[col])
@@ -132,14 +106,17 @@ def main():
 
     y = y.abs()
 
-    keep = ~y.isna()
+    # 💡 核心安全檢查：為了符合電導模型，特徵值9(電壓)必須大於0，避免計算 y / 電壓時除以零
+    df["特徵值9"] = pd.to_numeric(df["特徵值9"], errors="coerce")
+    
+    keep = (~y.isna()) & (~df["特徵值9"].isna()) & (df["特徵值9"] > 0)
     df = df.loc[keep].copy()
     y = y.loc[keep].copy()
     
     print(f"清理完成！最終有效用於訓練的樣本數: {len(df)} 筆\n")
 
     if len(df) == 0:
-        print("❌ 錯誤：沒有任何有效數據可用於訓練，請檢查上述怪異 Y 資料格式！")
+        print("❌ 錯誤：沒有任何有效數據可用於訓練，請檢查 Y 資料格式或特徵值9是否有大於0的數值！")
         return
 
     # 5) X 缺值處理
@@ -149,14 +126,16 @@ def main():
     X_raw[NUMERIC_COLS] = X_raw[NUMERIC_COLS].fillna(numeric_medians)
     X_raw[CATEGORICAL_COLS] = X_raw[CATEGORICAL_COLS].fillna("<NA>")
 
-    groups = df.index.to_series().astype(str)
+    # 🌟【同步更新】依據 24 個特徵完全相同者歸為同組，實現嚴格跨組驗證
+    groups = X_raw.groupby(FEATURE_COLS, dropna=False).ngroup().values
 
     # One-hot encoding
     X = pd.get_dummies(X_raw, columns=CATEGORICAL_COLS, drop_first=False)
     trained_features_columns = X.columns.tolist()
 
-    print("=== Configuration Summary (No Grouping Control) ===")
-    print(f"Unique design groups: {groups.nunique()} (Every row is a separate group)")
+    print("=== Configuration Summary (Strict Multi-Feature Grouping) ===")
+    print(f"分組控制模式: 24個特徵完全相同者歸為同組")
+    print(f"不重複的獨立群組總數 (Unique design groups): {len(np.unique(groups))}")
     print(f"X shape after one-hot: {X.shape}\n")
 
     # 6) 初始化 12 組模型與評估字典
@@ -176,6 +155,10 @@ def main():
             X_train, X_test = X.iloc[train_idx].copy(), X.iloc[test_idx].copy()
             y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
+            # 💡【核心修改】現在「所有模型」在訓練前都將目標變數轉為電導 (y / 電壓)
+            v_train = X_train["特徵值9"]
+            y_train_conductance = y_train / v_train
+
             scaler = StandardScaler()
             X_train_scaled = scaler.fit_transform(X_train)
             X_test_scaled = scaler.transform(X_test)
@@ -183,13 +166,20 @@ def main():
             try:
                 from sklearn.base import clone
                 fold_model = clone(model_obj)
-                fold_model.fit(X_train_scaled, y_train)
-                y_pred = fold_model.predict(X_test_scaled)
+                fold_model.fit(X_train_scaled, y_train_conductance)
+                
+                # 預測得到的是等效電導
+                pred_conductance = fold_model.predict(X_test_scaled)
 
-                fold_r2.append(r2_score(y_test, y_pred))
-                fold_rmse.append(mean_squared_error(y_test, y_pred) ** 0.5)
-                fold_mape.append(mean_absolute_percentage_error(y_test, y_pred) * 100)
+                # 💡【核心修改】所有模型在評估性能前，都必須乘以電壓還原成電流與真實的 y_test 比較
+                v_test = X_test["特徵值9"]
+                y_pred_current = pred_conductance * v_test
+
+                fold_r2.append(r2_score(y_test, y_pred_current))
+                fold_rmse.append(mean_squared_error(y_test, y_pred_current) ** 0.5)
+                fold_mape.append(mean_absolute_percentage_error(y_test, y_pred_current) * 100)
             except Exception as e:
+                print(f"Fold error in {model_name}: {e}")
                 continue
 
         if fold_r2:
@@ -205,8 +195,11 @@ def main():
         global_scaler = StandardScaler()
         X_scaled_full = global_scaler.fit_transform(X)
         
+        # 💡【核心修改】全量訓練時，所有模型的目標變數皆轉為電導
+        y_full_conductance = y / X["特徵值9"]
+
         final_model = clone(model_obj)
-        final_model.fit(X_scaled_full, y)
+        final_model.fit(X_scaled_full, y_full_conductance)
         
         final_trained_models[model_name] = {
             "model": final_model,
@@ -217,7 +210,7 @@ def main():
     summary_df = pd.DataFrame(model_results)
     summary_df = summary_df.sort_values(by="Avg R2", ascending=False).reset_index(drop=True)
 
-    print("\n" + "="*20 + " 12 Models CV Performance Summary (Tree Models Integrated) " + "="*20)
+    print("\n" + "="*20 + " 12 Models CV Performance Summary (All Models Physics Optimized) " + "="*20)
     print(summary_df.to_string(index=True, formatters={
         "Avg R2": "{:.6f}".format,
         "Avg RMSE": "{:.6f}".format,
@@ -228,14 +221,25 @@ def main():
     print("\nSaved summary to 'cv5_12_models_trees_summary.csv'")
 
     # ==================================================
-    # 9) 💡 修改處：自動對程式內設定的兩組數據進行預測
+    # 9) 讀取外部測試檔，並批次整合輸出為 CSV 檔
     # ==================================================
-    print("\n" + "="*25 + " 兩組特定測試數據預測結果 " + "="*25)
+    print("\n" + "="*25 + " 讀取外部測試檔並進行整批預測 " + "="*25)
     
-    # 載入內建的兩組測試數據
-    df_user = get_test_samples()
+    try:
+        try:
+            df_user = pd.read_csv(TEST_EXCEL_PATH, encoding="utf-8-sig", low_memory=False)
+        except UnicodeDecodeError:
+            print("💡 提示：測試檔非 UTF-8 編碼，切換至 CP950 (ANSI/Big5) 編碼讀取...")
+            df_user = pd.read_csv(TEST_EXCEL_PATH, encoding="cp950", low_memory=False)
+    except FileNotFoundError:
+        print(f"❌ 錯誤：找不到測試檔案，請確認路徑是否正確：{TEST_EXCEL_PATH}")
+        return
+
+    df_user.columns = df_user.columns.str.strip()
     
-    # 針對內建數據同樣做清洗（例如處理可能帶有 % 的欄位）
+    existing_features = [c for c in FEATURE_COLS if c in df_user.columns]
+    output_df = df_user[existing_features].copy()
+    
     for col in FEATURE_COLS:
         if col in df_user.columns and df_user[col].astype(str).str.contains("%", na=False).any():
             df_user[col] = to_ratio_series(df_user[col])
@@ -249,39 +253,41 @@ def main():
     df_user[CATEGORICAL_COLS] = df_user[CATEGORICAL_COLS].fillna("<NA>")
     
     # 進行 One-hot encoding 並對齊訓練特徵維度
-    df_user_encoded = pd.get_dummies(df_user, columns=CATEGORICAL_COLS)
+    df_user_encoded = pd.get_dummies(df_user[FEATURE_COLS], columns=CATEGORICAL_COLS)
     for col in trained_features_columns:
         if col not in df_user_encoded.columns:
             df_user_encoded[col] = 0
             
     df_user_encoded = df_user_encoded[trained_features_columns]
 
-    # 分別對第 1 組與第 2 組數據進行預測
-    for idx in range(len(df_user)):
-        print(f"\n👉 【測試數據第 {idx + 1} 組】的預測結果列表：")
-        single_sample = df_user_encoded.iloc[[idx]]
+    print(f"成功載入測試數據共計 {len(df_user)} 筆樣本，開始批次進行預測...")
+    
+    # 備份測試集中的電壓欄位，供所有模型預測後還原電流使用
+    v_test_user = df_user_encoded["特徵值9"].astype(float)
+
+    # 依交叉驗證 R2 表現從高到低的順序，將各模型的預測結果併入 output_df 中
+    for model_name in summary_df["Model Name"]:
+        model_pack = final_trained_models[model_name]
+        mdl = model_pack["model"]
+        scl = model_pack["scaler"]
         
-        prediction_results = []
-        # 依交叉驗證 R2 表現從高到低排序輸出
-        for model_name in summary_df["Model Name"]:
-            model_pack = final_trained_models[model_name]
-            mdl = model_pack["model"]
-            scl = model_pack["scaler"]
-            
-            # 依該模型的縮放器進行標準化
-            single_sample_scaled = scl.transform(single_sample)
-            
-            # 預測
-            pred_val = mdl.predict(single_sample_scaled)[0]
-            prediction_results.append({
-                "模型名稱": model_name,
-                "預測數值": pred_val
-            })
-            
-        pred_summary_df = pd.DataFrame(prediction_results)
-        print(pred_summary_df.to_string(index=False, formatters={"預測數值": "{:.6f}".format}))
+        # 依該模型的縮放器進行標準化
+        df_user_scaled = scl.transform(df_user_encoded)
         
-    print("\n" + "="*70)
+        # 預測
+        raw_pred_conductance = mdl.predict(df_user_scaled)
+        
+        # 💡【核心修改】現在所有模型預測出來的都是電導，一律乘以電壓還原成電流後再寫入輸出檔
+        output_df[f"Pred_{model_name}"] = raw_pred_conductance * v_test_user
+        
+    # 將整合後的結果導出為新的 CSV 檔案
+    output_filename = "test_predictions_result(no).csv"
+    output_df.to_csv(output_filename, index=False, encoding="utf-8-sig")
+    
+    print("\n" + "="*50)
+    print(f"🎉 測試集預測完畢！結果已成功打包儲存至: {output_filename}")
+    print(f"該檔案保留了原始特徵，並在右側依 R2 表現排序新增了 12 個模型的預測結果欄位。")
+    print("="*50)
 
 if __name__ == "__main__":
     main()

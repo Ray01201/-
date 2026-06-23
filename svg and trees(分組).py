@@ -14,8 +14,8 @@ from lightgbm import LGBMRegressor
 # =========================
 # USER SETTINGS
 # =========================
-EXCEL_PATH = r"C:\專題\raw data_正(raw data).csv"
-TARGET_COL = "Output 2"
+EXCEL_PATH = r"C:\專題\raw data_正.csv"
+TARGET_COL = "Output 1"
 
 CATEGORICAL_COLS = ["特徵值1", "特徵值2", "特徵值3", "特徵值4", "特徵值7", "特徵值8", "特徵值24"]
 NUMERIC_COLS = [
@@ -58,11 +58,10 @@ def get_12_models():
 
 def get_test_samples():
     """
-    💡 在這裡直接寫死兩組測試數據。
-    請根據您的實際資料狀況修改底下的數值（若沒寫到的欄位會自動帶入中位數或空類別）
+    直接寫死兩組測試數據。
     """
     samples = [
-        # 第一組測試數據
+        # 第一組測試數據 (電壓特徵值9 = 500)
         {
             "特徵值1": "T", "特徵值2": "0.02", "特徵值3": "QFP", "特徵值4": "wirebond", 
             "特徵值7": "GND", "特徵值8": "正", "特徵值24": "Ins",
@@ -71,7 +70,7 @@ def get_test_samples():
             "特徵值15": 2, "特徵值16": 4.76, "特徵值17": 6.42, "特徵值18": 30.51, 
             "特徵值19": 0.11, "特徵值20": 7.01, "特徵值21": 7.01, "特徵值22": 49.15, "特徵值23": 0.18
         },
-        # 第二組測試數據
+        # 第二組測試數據 (電壓特徵值9 = 450)
         {
             "特徵值1": "T", "特徵值2": "0.02", "特徵值3": "QFP", "特徵值4": "wirebond", 
             "特徵值7": "GND", "特徵值8": "正", "特徵值24": "Ins",
@@ -142,21 +141,23 @@ def main():
         print("❌ 錯誤：沒有任何有效數據可用於訓練，請檢查上述怪異 Y 資料格式！")
         return
 
-    # 5) X 缺值處理
+    # 5) 💡 修改處：還原為 24 特徵值組合的分組控制 (GroupKFold)
     X_raw = df[FEATURE_COLS].copy()
     
     numeric_medians = X_raw[NUMERIC_COLS].median()
     X_raw[NUMERIC_COLS] = X_raw[NUMERIC_COLS].fillna(numeric_medians)
     X_raw[CATEGORICAL_COLS] = X_raw[CATEGORICAL_COLS].fillna("<NA>")
 
-    groups = df.index.to_series().astype(str)
+    # 用 24 特徵組合當 group，同設計條件不交叉洩漏
+    groups = X_raw.fillna("<NA>").astype(str).agg("|".join, axis=1)
 
     # One-hot encoding
     X = pd.get_dummies(X_raw, columns=CATEGORICAL_COLS, drop_first=False)
     trained_features_columns = X.columns.tolist()
 
-    print("=== Configuration Summary (No Grouping Control) ===")
-    print(f"Unique design groups: {groups.nunique()} (Every row is a separate group)")
+    print("=== Configuration Summary (GroupKFold Enabled) ===")
+    print(f"Total samples: {len(df)}")
+    print(f"Unique design groups: {groups.nunique()}")
     print(f"X shape after one-hot: {X.shape}\n")
 
     # 6) 初始化 12 組模型與評估字典
@@ -217,7 +218,7 @@ def main():
     summary_df = pd.DataFrame(model_results)
     summary_df = summary_df.sort_values(by="Avg R2", ascending=False).reset_index(drop=True)
 
-    print("\n" + "="*20 + " 12 Models CV Performance Summary (Tree Models Integrated) " + "="*20)
+    print("\n" + "="*20 + " 12 Models CV Performance Summary (GroupKFold Controlled) " + "="*20)
     print(summary_df.to_string(index=True, formatters={
         "Avg R2": "{:.6f}".format,
         "Avg RMSE": "{:.6f}".format,
@@ -228,14 +229,14 @@ def main():
     print("\nSaved summary to 'cv5_12_models_trees_summary.csv'")
 
     # ==================================================
-    # 9) 💡 修改處：自動對程式內設定的兩組數據進行預測
+    # 9) 自動對程式內設定的兩組數據進行預測
     # ==================================================
     print("\n" + "="*25 + " 兩組特定測試數據預測結果 " + "="*25)
     
     # 載入內建的兩組測試數據
     df_user = get_test_samples()
     
-    # 針對內建數據同樣做清洗（例如處理可能帶有 % 的欄位）
+    # 針對內建數據同樣做清洗
     for col in FEATURE_COLS:
         if col in df_user.columns and df_user[col].astype(str).str.contains("%", na=False).any():
             df_user[col] = to_ratio_series(df_user[col])
@@ -258,7 +259,7 @@ def main():
 
     # 分別對第 1 組與第 2 組數據進行預測
     for idx in range(len(df_user)):
-        print(f"\n👉 【測試數據第 {idx + 1} 組】的預測結果列表：")
+        print(f"\n👉 【測試數據第 {idx + 1} 組 (電壓={df_user.iloc[idx]['特徵值9']})】的預測結果列表：")
         single_sample = df_user_encoded.iloc[[idx]]
         
         prediction_results = []

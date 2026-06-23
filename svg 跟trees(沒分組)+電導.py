@@ -1,7 +1,8 @@
 import numpy as np
 import pandas as pd
 
-from sklearn.model_selection import GroupKFold
+# 💡 核心修改：改用標準 KFold (不分組)
+from sklearn.model_selection import KFold
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_percentage_error
 from sklearn.preprocessing import StandardScaler
 
@@ -15,7 +16,7 @@ from lightgbm import LGBMRegressor
 # USER SETTINGS
 # =========================
 EXCEL_PATH = r"C:\專題\raw data_正(raw data).csv"
-TARGET_COL = "Output 2"
+TARGET_COL = "Output 1"
 
 CATEGORICAL_COLS = ["特徵值1", "特徵值2", "特徵值3", "特徵值4", "特徵值7", "特徵值8", "特徵值24"]
 NUMERIC_COLS = [
@@ -124,7 +125,7 @@ def main():
     if bad_count > 0:
         print(f"\n⚠️ 發現真正無法轉換的怪異 Y 資料共 {bad_count} 筆。以下抽樣前 15 筆展示：")
         debug_df = pd.DataFrame({
-            "原始欄位數值": y_raw_series[is_bad],
+            "原始欄位數位": y_raw_series[is_bad],
             "清理後的文字": y_str[is_bad]
         })
         print(debug_df.head(15).to_string())
@@ -132,14 +133,17 @@ def main():
 
     y = y.abs()
 
-    keep = ~y.isna()
+    # 💡 核心安全檢查：為了符合物理電導模型，特徵值9(電壓)必須大於0，避免除以零
+    df["特徵值9"] = pd.to_numeric(df["特徵值9"], errors="coerce")
+
+    keep = (~y.isna()) & (~df["特徵值9"].isna()) & (df["特徵值9"] > 0)
     df = df.loc[keep].copy()
     y = y.loc[keep].copy()
     
     print(f"清理完成！最終有效用於訓練的樣本數: {len(df)} 筆\n")
 
     if len(df) == 0:
-        print("❌ 錯誤：沒有任何有效數據可用於訓練，請檢查上述怪異 Y 資料格式！")
+        print("❌ 錯誤：沒有任何有效數據可用於訓練，請檢查上述怪異 Y 資料格式與特徵值9！")
         return
 
     # 5) X 缺值處理
@@ -149,14 +153,13 @@ def main():
     X_raw[NUMERIC_COLS] = X_raw[NUMERIC_COLS].fillna(numeric_medians)
     X_raw[CATEGORICAL_COLS] = X_raw[CATEGORICAL_COLS].fillna("<NA>")
 
-    groups = df.index.to_series().astype(str)
-
     # One-hot encoding
     X = pd.get_dummies(X_raw, columns=CATEGORICAL_COLS, drop_first=False)
     trained_features_columns = X.columns.tolist()
 
-    print("=== Configuration Summary (No Grouping Control) ===")
-    print(f"Unique design groups: {groups.nunique()} (Every row is a separate group)")
+    # 💡 核心修改：終端機提示資訊同步更新為無分組控制
+    print("=== Configuration Summary (Standard KFold - No Grouping Control) ===")
+    print(f"驗證模式: 標準 5-Fold 隨機交叉驗證（無分組限制）")
     print(f"X shape after one-hot: {X.shape}\n")
 
     # 6) 初始化 12 組模型與評估字典
@@ -164,17 +167,21 @@ def main():
     model_results = []
     final_trained_models = {}
 
-    # 7) 開始對 12 組模型各自進行 Group 5-Fold 交叉驗證
-    gkf = GroupKFold(n_splits=N_SPLITS)
+    # 7) 💡 核心修改：改用標準 KFold (隨機洗牌切分) 進行交叉驗證
+    kf = KFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
 
     for model_name, model_obj in all_models.items():
         print(f"Running Cross-Validation for: {model_name}...")
         
         fold_r2, fold_rmse, fold_mape = [], [], []
         
-        for train_idx, test_idx in gkf.split(X, y, groups=groups):
+        for train_idx, test_idx in kf.split(X):
             X_train, X_test = X.iloc[train_idx].copy(), X.iloc[test_idx].copy()
             y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+            # 💡【物理轉換】所有模型在訓練前，都將 y 轉為電導 (y / 電壓)
+            v_train = X_train["特徵值9"]
+            y_train_conductance = y_train / v_train
 
             scaler = StandardScaler()
             X_train_scaled = scaler.fit_transform(X_train)
@@ -183,12 +190,18 @@ def main():
             try:
                 from sklearn.base import clone
                 fold_model = clone(model_obj)
-                fold_model.fit(X_train_scaled, y_train)
-                y_pred = fold_model.predict(X_test_scaled)
+                fold_model.fit(X_train_scaled, y_train_conductance)
+                
+                # 預測得到等效電導
+                pred_conductance = fold_model.predict(X_test_scaled)
 
-                fold_r2.append(r2_score(y_test, y_pred))
-                fold_rmse.append(mean_squared_error(y_test, y_pred) ** 0.5)
-                fold_mape.append(mean_absolute_percentage_error(y_test, y_pred) * 100)
+                # 💡【物理轉換】所有模型在評估性能前，都乘回電壓還原成電流，與 y_test 比較
+                v_test = X_test["特徵值9"]
+                y_pred_current = pred_conductance * v_test
+
+                fold_r2.append(r2_score(y_test, y_pred_current))
+                fold_rmse.append(mean_squared_error(y_test, y_pred_current) ** 0.5)
+                fold_mape.append(mean_absolute_percentage_error(y_test, y_pred_current) * 100)
             except Exception as e:
                 continue
 
@@ -205,8 +218,11 @@ def main():
         global_scaler = StandardScaler()
         X_scaled_full = global_scaler.fit_transform(X)
         
+        # 💡【物理轉換】全量訓練時，所有模型的目標變數皆轉為電導
+        y_full_conductance = y / X["特徵值9"]
+
         final_model = clone(model_obj)
-        final_model.fit(X_scaled_full, y)
+        final_model.fit(X_scaled_full, y_full_conductance)
         
         final_trained_models[model_name] = {
             "model": final_model,
@@ -217,7 +233,7 @@ def main():
     summary_df = pd.DataFrame(model_results)
     summary_df = summary_df.sort_values(by="Avg R2", ascending=False).reset_index(drop=True)
 
-    print("\n" + "="*20 + " 12 Models CV Performance Summary (Tree Models Integrated) " + "="*20)
+    print("\n" + "="*20 + " 12 Models CV Performance Summary (All Models Physics) " + "="*20)
     print(summary_df.to_string(index=True, formatters={
         "Avg R2": "{:.6f}".format,
         "Avg RMSE": "{:.6f}".format,
@@ -228,9 +244,9 @@ def main():
     print("\nSaved summary to 'cv5_12_models_trees_summary.csv'")
 
     # ==================================================
-    # 9) 💡 修改處：自動對程式內設定的兩組數據進行預測
+    # 9) 💡 自動對程式內設定的兩組數據進行預測
     # ==================================================
-    print("\n" + "="*25 + " 兩組特定測試數據預測結果 " + "="*25)
+    print("\n" + "="*25 + " 兩組特定測試數據預測結果 (物理轉換還原版) " + "="*25)
     
     # 載入內建的兩組測試數據
     df_user = get_test_samples()
@@ -256,9 +272,12 @@ def main():
             
     df_user_encoded = df_user_encoded[trained_features_columns]
 
+    # 💡 備份內建測試數據中的電壓值（特徵值9），用於最後還原預測值
+    v_test_samples = df_user_encoded["特徵值9"].astype(float).values
+
     # 分別對第 1 組與第 2 組數據進行預測
     for idx in range(len(df_user)):
-        print(f"\n👉 【測試數據第 {idx + 1} 組】的預測結果列表：")
+        print(f"\n👉 【測試數據第 {idx + 1} 組 (電壓 = {v_test_samples[idx]} V)】的預測結果列表：")
         single_sample = df_user_encoded.iloc[[idx]]
         
         prediction_results = []
@@ -271,11 +290,15 @@ def main():
             # 依該模型的縮放器進行標準化
             single_sample_scaled = scl.transform(single_sample)
             
-            # 預測
-            pred_val = mdl.predict(single_sample_scaled)[0]
+            # 預測得到電導
+            pred_conductance = mdl.predict(single_sample_scaled)[0]
+            
+            # 💡【核心修改】不論哪種模型，在此步驟皆乘以該組的電壓值，還原成真正的電流輸出
+            pred_current = pred_conductance * v_test_samples[idx]
+            
             prediction_results.append({
                 "模型名稱": model_name,
-                "預測數值": pred_val
+                "預測數值": pred_current
             })
             
         pred_summary_df = pd.DataFrame(prediction_results)
